@@ -11,8 +11,10 @@ Usage: python pipeline.py [--skip-scrape] [--skip-wiki-images]
 
 import argparse
 import csv
+import logging
 import os
 import re
+import sys
 from pathlib import Path
 
 from supabase import create_client, Client  # pylint: disable=import-error
@@ -49,8 +51,16 @@ def _get_supabase_credentials() -> tuple[str, str]:
 _load_env()
 
 # -----------------------------------------------------------------------------
-# Config
+# Config & Logging
 # -----------------------------------------------------------------------------
+
+# Configure logging to stdout
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 
 STORAGE_BUCKET = "song-images"
 SONGS_BY_LEVEL_CSV = "songs_by_level.csv"
@@ -132,7 +142,7 @@ def upload_local_file_to_storage(
                 storage_filename
             )
             return image_url_without_revision(public_url)
-        print(f"  Upload failed for {storage_filename}: {err}")
+        logger.error("Upload failed for %s: %s", storage_filename, err)
         return None
 
     public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(storage_filename)
@@ -153,20 +163,20 @@ def run_pipeline(  # pylint: disable=too-many-locals,too-many-branches,too-many-
         with open(csv_path, newline="", encoding="utf-8") as csv_file:
             reader = csv.DictReader(csv_file)
             rows = list(reader)
-        print(f"Using existing {SONGS_BY_LEVEL_CSV} ({len(rows)} rows).")
+        logger.info("Using existing %s (%d rows).", SONGS_BY_LEVEL_CSV, len(rows))
     else:
         rows = scrape_songs_by_level(save_path=str(csv_path))
         if not rows:
-            print("No rows from scrape. Exiting.")
+            logger.error("No rows from scrape. Exiting.")
             return
 
     # 2. Download wiki images
     if not skip_wiki_images:
         download_wiki_images(download_dir=images_dir)
     else:
-        print("Skipping wiki-images download.")
+        logger.info("Skipping wiki-images download.")
     if not images_dir.is_dir():
-        print("wiki_images/ not found. Exiting.")
+        logger.error("wiki_images/ not found. Exiting.")
         return
 
     # 3. Build title -> local file path
@@ -197,7 +207,7 @@ def run_pipeline(  # pylint: disable=too-many-locals,too-many-branches,too-many-
             url = upload_local_file_to_storage(supabase, local_path, storage_name)
             if url:
                 song_to_image_url[song] = url
-                print(f"  Uploaded {storage_name}")
+                logger.info("Uploaded %s", storage_name)
 
     # 5. Build rows with imageUrl
     export_rows = []
@@ -224,7 +234,7 @@ def run_pipeline(  # pylint: disable=too-many-locals,too-many-branches,too-many-
         writer = csv.DictWriter(out_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(export_rows)
-    print(f"Wrote {len(export_rows)} rows to {EXPORT_CSV}.")
+    logger.info("Wrote %d rows to %s.", len(export_rows), EXPORT_CSV)
 
     # 7. Upsert into Supabase songs (map song -> title, chart_constant -> constant)
     db_rows = []
@@ -250,8 +260,8 @@ def run_pipeline(  # pylint: disable=too-many-locals,too-many-branches,too-many-
             ignore_duplicates=True,
         ).execute()
         total += len(batch)
-        print(f"  Upserted rows {i + 1}-{total}")
-    print(f"Done. Upserted {total} rows into songs table.")
+        logger.info("Upserted rows %d-%d", i + 1, total)
+    logger.info("Done. Upserted %d rows into songs table.", total)
 
 
 def main() -> int:
@@ -275,7 +285,7 @@ def main() -> int:
         )
         return 0
     except Exception as err:
-        print(f"Error: {err}")
+        logger.error("Pipeline failed: %s", err)
         raise SystemExit(1) from err
 
 
