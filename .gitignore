@@ -7,6 +7,5 @@ __pycache__/
 *.pyc
 
 # Generated / large data (optional; remove if you want to commit)
-# wiki_images/
-# songs_by_level.csv
-# songs_export.csv
+wiki_images/
+*.csv
