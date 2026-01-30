@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""
+Python migration script to move song images to Supabase Storage
+- Fetches all rows from `songs`
+- Uploads each image from its current URL to the `song-images` bucket
+- Updates `imageUrl` in the `songs` table to the new public URL
+
+Requirements:
+  pip install supabase-py requests python-dotenv
+  # or
+  pip install supabase requests python-dotenv
+
+Env vars needed:
+  SUPABASE_URL
+  SUPABASE_SERVICE_ROLE_KEY   (or anon if policies allow UPDATE/INSERT)
+"""
+
+import os
+import time
+import re
+import requests
+from typing import Optional, Tuple
+
+from supabase import create_client, Client  # supabase-py
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get(
+    "SUPABASE_ANON_KEY"
+)
+STORAGE_BUCKET = "song-images"
+BATCH_SIZE = 10
+SLEEP_BETWEEN_BATCHES = 0.2  # seconds
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError(
+        "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY/ANON_KEY must be set in env."
+    )
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def safe_title(title: str) -> str:
+    """Mirror the TS generateFileName title logic: non-alnum -> '_', lower, max 50 chars."""
+    cleaned = re.sub(r"[^a-zA-Z0-9]", "_", title or "")
+    return cleaned.lower()[:50]
+
+
+def get_ext_from_url(url: str) -> str:
+    """Extract extension from URL; default to jpg."""
+    if not url:
+        return "jpg"
+    # strip query
+    path = url.split("?")[0]
+    if "." in path:
+        ext = path.rsplit(".", 1)[1].lower()
+        if ext:
+            return ext
+    return "jpg"
+
+
+def generate_file_name(song: dict) -> str:
+    """Generate filename:
+    - For BYD/Beyond: {safeTitle}_{difficulty}_{id}.{ext}
+    - For others: {safeTitle}.{ext} (shared image for all non-BYD difficulties)
+    """
+    title = song.get("title", "")
+    difficulty = (song.get("difficulty") or "").lower()
+    song_id = song.get("id")
+    image_url = song.get("imageUrl", "")
+
+    safe_title_str = safe_title(title)
+    ext = get_ext_from_url(image_url)
+
+    # Only include difficulty and ID for BYD/Beyond difficulties
+    if difficulty in ["beyond", "byd"]:
+        base = f"{safe_title_str}_{difficulty}"
+    else:
+        # Non-BYD difficulties share the same image file
+        base = safe_title_str
+
+    return f"{base}.{ext}"
+
+
+def image_url_without_revision(url: str) -> str:
+    """Remove /revision/latest from Supabase image URL so transforms use short path."""
+    if not url:
+        return url
+    return url.replace("/revision/latest", "")
+
+
+def get_content_type_from_ext(ext: str) -> str:
+    """Map file extension to MIME type."""
+    mime_types = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "gif": "image/gif",
+        "webp": "image/webp",
+        "svg": "image/svg+xml",
+    }
+    return mime_types.get(ext.lower(), "image/jpeg")  # default to jpeg
+
+
+def file_exists_in_bucket(file_path: str) -> bool:
+    """Check if a file already exists in the storage bucket."""
+    try:
+        # Try to list all files and check if our file exists
+        # Since files are stored flat, we can list from root
+        res = supabase.storage.from_(STORAGE_BUCKET).list(path="")
+        if res:
+            # res might be a list of dicts or objects
+            for item in res:
+                # Handle both dict and object access
+                name = (
+                    item.get("name")
+                    if isinstance(item, dict)
+                    else getattr(item, "name", None)
+                )
+                if name == file_path:
+                    return True
+        return False
+    except Exception as e:
+        # If listing fails, try to get the file directly via public URL
+        # If we can access it, it exists
+        try:
+            public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(
+                file_path
+            )
+            # Try to HEAD request to check if file exists
+            head_resp = requests.head(public_url, timeout=5)
+            return head_resp.status_code == 200
+        except:
+            # If all checks fail, assume file doesn't exist
+            return False
+
+
+def upload_image_to_storage(image_url: str, file_name: str) -> Optional[str]:
+    """Download image from image_url and upload to Supabase Storage; return public URL or None."""
+    try:
+        resp = requests.get(image_url, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  ✗ Failed to fetch image {image_url}: {e}")
+        return None
+
+    file_bytes = resp.content
+    file_path = file_name  # flat path; adjust if you want folders
+
+    # Determine content type from response headers or file extension
+    content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+    if not content_type or content_type == "text/plain":
+        # Fall back to extension-based detection
+        ext = get_ext_from_url(file_name)
+        content_type = get_content_type_from_ext(ext)
+
+    print(f"  → Uploading {file_path} with content-type: {content_type}")
+
+    try:
+        file_options = {"content-type": content_type}
+        res = supabase.storage.from_(STORAGE_BUCKET).upload(
+            file_path, file_bytes, file_options=file_options
+        )
+        # supabase-py returns an object, not a dict, so we can't use "in"
+        error = getattr(res, "error", None)
+        if error:
+            error_str = str(error).lower()
+            # If file already exists, treat as success (don't overwrite)
+            if "already exists" in error_str or "duplicate" in error_str:
+                print(f"  • File {file_path} already exists, using existing file")
+                public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(
+                    file_path
+                )
+                return image_url_without_revision(public_url)
+            print(f"  ✗ Storage upload error: {error}")
+            return None
+    except Exception as e:
+        # If file already exists, treat as success (don't overwrite)
+        error_str = str(e).lower()
+        if "already exists" in error_str or "duplicate" in error_str:
+            print(f"  • File {file_path} already exists, using existing file")
+            public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(
+                file_path
+            )
+            return image_url_without_revision(public_url)
+        print(f"  ✗ Storage exception while uploading {file_path}: {e}")
+        return None
+
+    public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_path)
+    return image_url_without_revision(public_url)
+
+
+def update_song_image_url(song_id: int, new_url: str) -> bool:
+    """Update songs.imageUrl column with Supabase Storage URL for given song ID.
+
+    This replaces the original external URL with the Supabase Storage public URL.
+    """
+    try:
+        # Perform the update
+        res = (
+            supabase.table("songs")
+            .update({"imageUrl": new_url})  # Always update to Supabase Storage URL
+            .eq("id", song_id)
+            .execute()
+        )
+
+        # Check for errors in different response formats
+        error = None
+        if hasattr(res, "error") and res.error:
+            error = res.error
+        elif isinstance(res, dict) and "error" in res:
+            error = res["error"]
+
+        if error:
+            print(f"  ✗ DB update error for song {song_id}: {error}")
+            return False
+
+        # Verify the update by querying the record (compare normalized URLs in case DB returns a different form)
+        verify_res = (
+            supabase.table("songs").select("imageUrl").eq("id", song_id).execute()
+        )
+        if hasattr(verify_res, "data") and verify_res.data:
+            updated_url = (
+                verify_res.data[0].get("imageUrl") if verify_res.data else None
+            )
+            norm_new = image_url_without_revision(new_url or "").strip()
+            norm_updated = image_url_without_revision(updated_url or "").strip()
+            if norm_new == norm_updated or updated_url == new_url:
+                print(f"  ✓ Verified update for song {song_id}")
+                return True
+            else:
+                print(
+                    f"  ✗ Update verification failed for song {song_id}: expected {new_url[:50]}..., got {updated_url[:50] if updated_url else 'None'}..."
+                )
+                return False
+        else:
+            # If verification query fails, assume update succeeded if no error was returned
+            print(
+                f"  ⚠ Update executed for song {song_id} but verification query failed"
+            )
+            return True
+
+    except Exception as e:
+        print(f"  ✗ Exception updating song {song_id}: {e}")
+        import traceback
+
+        print(f"  Traceback: {traceback.format_exc()}")
+        return False
+
+
+def fetch_all_songs(start_row: int = 1, end_row: int = None) -> list[dict]:
+    """Fetch songs from database with optional range.
+    
+    Args:
+        start_row: 1-based starting row number (default: 1)
+        end_row: 1-based ending row number (default: None = all rows)
+    
+    Examples:
+        fetch_all_songs()  # Fetch all songs
+        fetch_all_songs(1001, 1628)  # Fetch rows 1001-1628
+    """
+    print(f"Fetching songs from database (rows {start_row}-{end_row if end_row else 'end'})...")
+    
+    # Calculate offset and limit
+    # Supabase uses 0-based OFFSET, but we use 1-based row numbers
+    offset = start_row - 1
+    limit = None if end_row is None else (end_row - start_row + 1)
+    
+    query = supabase.table("songs").select("*")
+    
+    # Apply offset
+    if offset > 0:
+        query = query.offset(offset)
+    
+    # Apply limit
+    if limit is not None:
+        query = query.limit(limit)
+    
+    # Order by ID to ensure consistent ordering
+    query = query.order("id", desc=False)
+    
+    res = query.execute()
+    if getattr(res, "error", None):
+        raise RuntimeError(f"Error fetching songs: {res.error}")
+    
+    fetched_count = len(res.data or [])
+    print(f"Fetched {fetched_count} songs")
+    return res.data or []
+
+
+def migrate_all_images(
+    batch_size: int = BATCH_SIZE,
+    start_row: int = 1,
+    end_row: int = None,
+) -> Tuple[int, int, int, int]:
+    """
+    Migrate all images:
+    - Skips rows where imageUrl is already a Supabase Storage URL.
+    - Can process a specific range of rows.
+    
+    Args:
+        batch_size: Number of songs to process per batch
+        start_row: 1-based starting row number (default: 1)
+        end_row: 1-based ending row number (default: None = all rows)
+    
+    Returns (migrated, updated, failed, skipped).
+    """
+    songs = fetch_all_songs(start_row=start_row, end_row=end_row)
+    total = len(songs)
+    print(f"Total songs: {total}")
+
+    migrated = 0
+    updated = 0
+    failed = 0
+    skipped = 0
+
+    for i in range(0, total, batch_size):
+        batch = songs[i : i + batch_size]
+        print(f"\nProcessing batch {i+1}-{min(i+batch_size, total)} of {total}")
+
+        for song in batch:
+            song_id = song.get("id")
+            title = song.get("title", "")
+            current_url = song.get("imageUrl") or ""
+
+            # Already a Supabase Storage URL
+            if "/storage/v1/object/public/" in current_url:
+                print(f"  • Skipping {title} (id={song_id}) – already migrated")
+                skipped += 1
+                continue
+
+            if not current_url:
+                print(f"  • Skipping {title} (id={song_id}) – no imageUrl")
+                skipped += 1
+                continue
+
+            print(f"  → Migrating {title} (id={song_id})")
+            file_name = generate_file_name(song)
+
+            # Check if file already exists
+            difficulty = (song.get("difficulty") or "").lower()
+            is_beyond = difficulty in ["beyond", "byd"]
+            file_exists = file_exists_in_bucket(file_name)
+
+            if file_exists:
+                if is_beyond:
+                    # Beyond difficulty: file exists, but we need to ADD it (not overwrite)
+                    # This means Past-Future difficulties need the existing image
+                    # So we should skip this Beyond upload to keep the existing image for other difficulties
+                    print(
+                        f"  • File {file_name} already exists (Beyond difficulty) - keeping existing image for Past-Future difficulties"
+                    )
+                    existing_url = image_url_without_revision(
+                        supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
+                    )
+                    if update_song_image_url(song_id, existing_url):
+                        updated += 1
+                        skipped += 1
+                        print(f"  ✓ Updated DB with existing file for {title} (Beyond)")
+                    else:
+                        failed += 1
+                    continue
+                else:
+                    # Non-Beyond difficulty: file exists, skip upload
+                    print(
+                        f"  • File {file_name} already exists (non-Beyond), skipping upload"
+                    )
+                    existing_url = image_url_without_revision(
+                        supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
+                    )
+                    if update_song_image_url(song_id, existing_url):
+                        updated += 1
+                        skipped += 1
+                        print(f"  ✓ Updated DB with existing file for {title}")
+                    else:
+                        failed += 1
+                    continue
+
+            # File doesn't exist - upload it
+            new_url = upload_image_to_storage(current_url, file_name)
+
+            if not new_url:
+                print(f"  ✗ Failed to upload {title}")
+                failed += 1
+                continue
+
+            if update_song_image_url(song_id, new_url):
+                migrated += 1
+                updated += 1
+                print(f"  ✓ Migrated + updated DB for {title}")
+            else:
+                failed += 1
+                print(f"  ✗ Uploaded but failed to update DB for {title}")
+
+        # Avoid hammering the API
+        if i + batch_size < total:
+            time.sleep(SLEEP_BETWEEN_BATCHES)
+
+    print("\nMigration summary:")
+    print(f"  Migrated (uploaded) : {migrated}")
+    print(f"  Updated in DB       : {updated}")
+    print(f"  Failed              : {failed}")
+    print(f"  Skipped             : {skipped}")
+    return migrated, updated, failed, skipped
+
+
+def fix_image_urls_remove_revision():
+    """Update all song imageUrl values to remove /revision/latest from the path."""
+    songs = fetch_all_songs()
+    fixed = 0
+    for song in songs:
+        url = song.get("imageUrl") or ""
+        if "/revision/latest" not in url:
+            continue
+        new_url = image_url_without_revision(url)
+        if update_song_image_url(song["id"], new_url):
+            fixed += 1
+    print(f"Fixed {fixed} image URLs (removed /revision/latest)")
+    return fixed
+
+
+if __name__ == "__main__":
+    fix_image_urls_remove_revision()
+    # Or run migration: migrate_all_images(start_row=1001, end_row=1700)
