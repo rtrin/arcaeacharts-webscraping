@@ -48,6 +48,23 @@ One command to scrape Songs by Level, download wiki images, upload jacket images
 python pipeline.py
 ```
 
+```mermaid
+graph TD
+    A[Start: pipeline.py] --> B{skip_scrape?}
+    B -- No --> C[scraper.py: scrape_songs_by_level]
+    C --> D[songs_by_level.csv]
+    B -- Yes --> D
+    D --> E{skip_wiki_images?}
+    E -- No --> F[scraper.py: download_wiki_images]
+    F --> G[wiki_images/]
+    E -- Yes --> G
+    G --> H[Map images to songs]
+    H --> I[Upload to Supabase Storage]
+    I --> J[Generate songs_export.csv]
+    J --> K[Upsert to Supabase 'songs' table]
+    K --> L[End]
+```
+
 Optional: `--skip-scrape` to reuse existing `songs_by_level.csv`; `--skip-wiki-images` to skip downloading images. Requires `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in the environment or in `.env` (anon key cannot write due to RLS).
 
 ## GitHub Actions (automated sync)
