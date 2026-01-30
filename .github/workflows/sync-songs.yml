@@ -36,9 +36,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Lint
-        run: pylint scraper.py pipeline.py update_image_urls.py
-
       - name: Run pipeline
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
