@@ -108,12 +108,6 @@ def run_pipeline(skip_scrape: bool = False) -> None:
         if not manual_candidates:
              logger.info("No manual candidates found.")
         else:
-            # Check DB for existing titles to avoid re-scraping manual songs if already present
-            logger.info("Checking DB for existing manual songs...")
-            # Supabase .in_() filter might hit URL limits if list is huge, but here it's small.
-            db_res = supabase.table("songs").select("title").in_("title", manual_candidates).execute()
-            existing_titles_db = set((item["title"] or "").strip().lower() for item in db_res.data)
-            
             missing_titles = []
             for t in manual_candidates:
                 # We compare loosely
@@ -122,11 +116,6 @@ def run_pipeline(skip_scrape: bool = False) -> None:
                 
                 # If it's in the CSV scrape, we good (it will be upserted/updated)
                 if lower_t in existing_titles_csv:
-                    continue
-                    
-                # If it's in the DB already, user wants to skip scraping it
-                if lower_t in existing_titles_db:
-                    logger.info(f"Skipping manual fetch for '{t}' (found in DB).")
                     continue
                     
                 missing_titles.append(t)
